@@ -4,15 +4,23 @@ import numpy as np
 import nibabel as nib
 import regtricks as rt
 import h5py
+import logging
+import argparse
+from glob import glob
 
+LOGGING_LEVEL = logging.DEBUG
 
-def _calc_norm_factor(oxdir, model_dict):
+def _calc_norm_factor(oxdir, model_dict, fsdir=None):
     """Calculates the normalisation factor for the subject's ASL data.
 
     Parameters
     ----------
     oxdir : str
         The oxasl directory containing the subject's processed ASL data.
+    model_dict : dict
+        The model dictionary.
+    fsdir : str, optional
+        The FreeSurfer directory containing the subject's structural data.
 
     Returns
     -------
@@ -20,22 +28,55 @@ def _calc_norm_factor(oxdir, model_dict):
         The normalisation factor.
     """
 
+    if model_dict["iscalib"]:
+        iscalib = "/calib_voxelwise"
+        logging.debug("Model setting: calibrated. Finding perfusion image after calibration")
+    else:
+        iscalib = ""
+        logging.debug("Model setting: uncalibrated. Finding perfusion image without calibration")
     if ~model_dict["isnorm"]:
+        logging.debug("Model setting: not normalised. Returning normalisation factor 1.0")
         return 1.0
-    iscalib = "/calib_voxelwise" if model_dict["iscalib"] else ""
-    ispvcorr = "_pvcorr" if model_dict["norm_ispvcorr"] else ""
+    if model_dict["norm_ispvcorr"]:
+        ispvcorr = "_pvcorr"
+        logging.debug("Model setting: using partial volume corrected perfusion image to calculate normalisation factor")
+    else:
+        ispvcorr = ""
+        logging.debug("Model setting: using un-partial volume corrected perfusion image to calculate normalisation factor")
 
     # Load the ASL data
-    # TODO: Check if the file exists
-    perf = nib.load(op.join(oxdir, f"output{ispvcorr}/struc{iscalib}/perfusion.nii.gz")).get_fdata()
+    perf_file = op.join(oxdir, f"output{ispvcorr}/struc{iscalib}/perfusion.nii.gz")
+    if not op.exists(perf_file):
+        logging.error(f"Perfusion image not found at {perf_file}")
+        raise FileNotFoundError(f"Perfusion image not found at {perf_file}")
+    perf = nib.load(perf_file).get_fdata()
+    logging.debug(f"Loaded perfusion image from {perf_file}")
 
     # Load the pvgm data
-    # TODO: Check if the file exists
-    pvgm = nib.load(op.join(oxdir, f"structural/gm_pv.nii.gz")).get_fdata()
+    pvgm_file = op.join(oxdir, "structural/gm_pv.nii.gz")
+    if not op.exists(pvgm_file):
+        logging.error(f"GM partial volume map not found at {pvgm_file}")
+        raise FileNotFoundError(f"GM partial volume map not found at {pvgm_file}")
+    pvgm = nib.load(pvgm_file).get_fdata()
+    logging.debug(f"Loaded GM partial volume map from {pvgm_file}")
+
+    # Load freesurfer ribbon mask (if provided)
+    if fsdir is not None:
+        logging.debug(f"Using FreeSurfer directory to find ribbon mask at {fsdir}")
+        ribbon_file = op.join(fsdir, "mri/ribbon.mgz")
+        if not op.exists(ribbon_file):
+            logging.error(f"Ribbon mask not found at {ribbon_file}")
+            raise FileNotFoundError(f"Ribbon mask not found at {ribbon_file}")
+        ribbon = rt.Registration.identity().apply_to_image(glob(ribbon_file)[0], perf, order=1)
+        logging.debug(f"Loaded ribbon mask from {ribbon_file}")
+        mask = (pvgm > model_dict["norm_thr"]) & (ribbon.get_fdata() > 0)
+    else:
+        logging.debug("No FreeSurfer directory provided. Using oxasl brain mask")
+        mask = (pvgm > model_dict["norm_thr"]) & (perf > 0)
 
     # Calculate the normalisation factor
-    norm_factor = perf[(pvgm > model_dict["norm_thr"]) & (perf > 0)].mean()
-
+    norm_factor = perf[mask].mean()
+    logging.debug(f"Calculated normalisation factor: {norm_factor}")
     return norm_factor
 
 
@@ -56,6 +97,21 @@ def predict(oxdir, modeldir, age, gender, space="native"):
         The space of the output image. Either 'native' 'struct' or 'std'.
     """
 
+    outdir = op.join(oxdir, "ppr", op.basename(modeldir).split(".")[0], space)
+    os.makedirs(outdir, exist_ok=True)
+    logging.basicConfig(
+        filename=op.join(outdir, "ppr.log"),
+        level=LOGGING_LEVEL,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        # handlers=[
+        #     logging.FileHandler("ppr.log"),
+        #     logging.StreamHandler()
+        # ]
+    )
+    logging.info("Running personalised perfusion reference (PPR) script")
+    logging.info(f"Output directory: {outdir}")
+
+    logging.info(f"Loading PPR model from {modeldir}")
     with h5py.File(modeldir, "r") as f:
         model_dict = {}
         for k in f.keys():
@@ -67,21 +123,25 @@ def predict(oxdir, modeldir, age, gender, space="native"):
                 model_dict[k] = f[k][()]
 
     norm_factor = _calc_norm_factor(oxdir, model_dict)
+    logging.debug(f"Input age: {age} years")
     age = age - model_dict["age_transform"]
+    logging.debug(f"Transformed age: {age} years")
+    logging.debug(f"Input gender {gender} (M/F)")
     gender = model_dict["gender_transform"][gender]
+    logging.debug(f"Transformed gender: {gender} (0/1)")
 
     iscalib = "/calib_voxelwise" if model_dict["iscalib"] else ""
 
-    outdir = op.join(oxdir, "ppr", model_dict["name"].decode("utf-8"), space)
-    os.makedirs(outdir, exist_ok=True)
-
+    logging.debug(f"Loading images from {oxdir}")
     native_spc = rt.ImageSpace(op.join(oxdir, "reg/aslref.nii.gz"))
     struct_spc = rt.ImageSpace(op.join(oxdir, "reg/strucref.nii.gz"))
     std_spc = rt.ImageSpace(op.join(oxdir, "reg/stdref.nii.gz"))
 
+    logging.debug(f"Loading model parameters")
     beta_std = model_dict["params_array"]
 
     if space == "native":
+        logging.info("Predicting baseline perfusion image in native space")
         target_spc = native_spc
         std2struct = rt.NonLinearRegistration.from_fnirt(
             op.join(oxdir, "reg/std2struc.nii.gz"),
@@ -107,6 +167,7 @@ def predict(oxdir, modeldir, age, gender, space="native"):
         truth = nib.load(op.join(oxdir, f"output/native{iscalib}/perfusion.nii.gz")).get_fdata() / norm_factor
 
     elif space == "struct":
+        logging.info("Predicting baseline perfusion image in structural space")
         target_spc = struct_spc
         std2struct = rt.NonLinearRegistration.from_fnirt(
             op.join(oxdir, "reg/std2struc.nii.gz"),
@@ -141,6 +202,7 @@ def predict(oxdir, modeldir, age, gender, space="native"):
         truth = nib.load(op.join(oxdir, f"output/struc{iscalib}/perfusion.nii.gz")).get_fdata() / norm_factor
 
     elif space == "std":
+        logging.info("Predicting baseline perfusion image in standard space")
         target_spc = std_spc
         asl2struct = rt.Registration.from_flirt(
             op.join(oxdir, "reg/asl2struc.mat"),
@@ -175,6 +237,11 @@ def predict(oxdir, modeldir, age, gender, space="native"):
             cores=1
         ) / norm_factor
 
+    else:
+        logging.error(f"Space {space} not recognised")
+        raise ValueError(f"Space {space} not recognised")
+
+    logging.debug("Generating baseline perfusion prediction")
     prediction = (
         beta[..., 0]
         + beta[..., 1] * age
@@ -192,7 +259,13 @@ def predict(oxdir, modeldir, age, gender, space="native"):
         ) 
         * pvwm
     )
+    logging.debug("Generated baseline perfusion prediction successfully")
+
     target_spc.save_image(prediction, op.join(outdir, "prediction.nii.gz"))
+    logging.info(f"Predicted baseline perfusion image saved to {op.join(outdir, 'prediction.nii.gz')}")
     target_spc.save_image(truth, op.join(outdir, "truth.nii.gz"))
-    residual = truth - prediction
-    target_spc.save_image(residual, op.join(outdir, "residual.nii.gz"))
+    logging.info(f"Ground truth perfusion image saved to {op.join(outdir, 'truth.nii.gz')}")
+    difference = truth - prediction
+    target_spc.save_image(difference, op.join(outdir, "difference.nii.gz"))
+    logging.info(f"Difference image saved to {op.join(outdir, 'difference.nii.gz')}")
+    logging.info("Prediction done")
