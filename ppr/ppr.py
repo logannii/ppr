@@ -2,6 +2,7 @@ import os
 import os.path as op
 import numpy as np
 import nibabel as nib
+import pandas as pd
 import regtricks as rt
 import h5py
 import logging
@@ -80,7 +81,7 @@ def _calc_norm_factor(oxdir, model_dict, fsdir=None):
     return norm_factor
 
 
-def predict(oxdir, modeldir, age, gender, space="native"):
+def predict(oxdir, modeldir, age, gender, space):
     """Predicts the baseline perfusion image for a given subject. 
 
     Parameters
@@ -103,12 +104,8 @@ def predict(oxdir, modeldir, age, gender, space="native"):
         filename=op.join(outdir, "ppr.log"),
         level=LOGGING_LEVEL,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        # handlers=[
-        #     logging.FileHandler("ppr.log"),
-        #     logging.StreamHandler()
-        # ]
     )
-    logging.info("Running personalised perfusion reference (PPR) script")
+    logging.info("Running personalised perfusion reference (PPR) prediction script")
     logging.info(f"Output directory: {outdir}")
 
     logging.info(f"Loading PPR model from {modeldir}")
@@ -118,7 +115,10 @@ def predict(oxdir, modeldir, age, gender, space="native"):
             if isinstance(f[k], h5py.Group):
                 model_dict[k] = {}
                 for k2 in f[k].keys():
-                    model_dict[k][k2] = f[k][k2][()]
+                    if isinstance(f[k][k2][()], bytes):
+                        model_dict[k][k2] = f[k][k2][()].decode("utf-8")
+                    else:
+                        model_dict[k][k2] = f[k][k2][()]
             else:
                 model_dict[k] = f[k][()]
 
@@ -266,6 +266,125 @@ def predict(oxdir, modeldir, age, gender, space="native"):
     target_spc.save_image(truth, op.join(outdir, "truth.nii.gz"))
     logging.info(f"Ground truth perfusion image saved to {op.join(outdir, 'truth.nii.gz')}")
     difference = truth - prediction
+    difference[prediction == 0] = 0
     target_spc.save_image(difference, op.join(outdir, "difference.nii.gz"))
     logging.info(f"Difference image saved to {op.join(outdir, 'difference.nii.gz')}")
     logging.info("Prediction done")
+
+
+def roi_stats(oxdir, modeldir, space="all", roiprobthr=50.0):
+    """Calculates statistics for the predicted perfusion images in the given space.
+
+    Parameters
+    ----------
+    oxdir : str
+        The oxasl directory containing the subject's processed ASL data.
+    model : str
+        The name of the model used for prediction.
+    space : str, optional
+        The space of the output image. Either 'native' 'struct' or 'std', or 'all'.
+    roiprobthr : float, optional
+        The probability threshold for the ROI masks.
+    """
+
+    if space == "all":
+        # find all spaces inside the ppr directory
+        spaces = os.listdir(op.join(oxdir, "ppr", op.basename(modeldir).split(".")[0]))
+        # remove anything other than native, struct, std
+        spaces = [s for s in spaces if s in ["native", "struct", "std"]]
+    else:
+        spaces = [space]
+
+    logging.info("Running ROI statistics script")
+    logging.info(f"Spaces: {spaces}")
+    logging.info(f"ROI probability threshold: {roiprobthr}")
+
+    for space in spaces:
+        logging.info(f"Calculating ROI statistics for space {space}")
+        outdir = op.join(oxdir, "ppr", op.basename(modeldir).split(".")[0], space)
+        logging.basicConfig(
+            filename=op.join(outdir, "ppr.log"),
+            level=LOGGING_LEVEL,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+        )
+        logging.info(f"Output directory: {outdir}")
+
+        logging.info(f"Loading PPR model from {modeldir}")
+        with h5py.File(modeldir, "r") as f:
+            model_dict = {}
+            for k in f.keys():
+                if isinstance(f[k], h5py.Group):
+                    model_dict[k] = {}
+                    for k2 in f[k].keys():
+                        if isinstance(f[k][k2][()], bytes):
+                            model_dict[k][k2] = f[k][k2][()].decode("utf-8")
+                        else:
+                            model_dict[k][k2] = f[k][k2][()]
+                else:
+                    model_dict[k] = f[k][()]
+
+        logging.debug(f"Loading images from {oxdir}")
+        native_spc = rt.ImageSpace(op.join(oxdir, "reg/aslref.nii.gz"))
+        struct_spc = rt.ImageSpace(op.join(oxdir, "reg/strucref.nii.gz"))
+        std_spc = rt.ImageSpace(op.join(oxdir, "reg/stdref.nii.gz"))
+
+        truth = nib.load(op.join(outdir, "truth.nii.gz")).get_fdata()
+        prediction = nib.load(op.join(outdir, "prediction.nii.gz")).get_fdata()
+        difference = nib.load(op.join(outdir, "difference.nii.gz")).get_fdata()
+        roi_masks = model_dict["roi_masks"]
+
+        if (space == "native") or (space == "struct"):
+            std2struct = rt.NonLinearRegistration.from_fnirt(
+                op.join(oxdir, "reg/std2struc.nii.gz"),
+                src=std_spc,
+                ref=struct_spc,
+                intensity_correct=False,
+            )
+            if space == "native":
+                struct2asl = rt.Registration.from_flirt(
+                    op.join(oxdir, "reg/struc2asl.mat"),
+                    src=struct_spc,
+                    ref=native_spc,
+                )
+                std2asl = rt.chain(std2struct, struct2asl)
+
+        roi_list = []
+
+        for i, roi_key in enumerate(model_dict["roi_dict"]):
+            logging.debug(f"Calculating statistics for ROI {roi_key}")
+            roi_mask = roi_masks[..., i]
+            if space == "native":
+                roi_mask = std2asl.apply_to_array(
+                    roi_mask, 
+                    src=std_spc, 
+                    ref=native_spc, 
+                    cores=1
+                )
+            elif space == "struct":
+                roi_mask = std2struct.apply_to_array(
+                    roi_mask, 
+                    src=std_spc, 
+                    ref=struct_spc, 
+                    cores=1
+                )
+            roi_mask = roi_mask > roiprobthr
+            roi_truth = truth[roi_mask]
+            roi_prediction = prediction[roi_mask]
+            roi_difference = difference[roi_mask]
+            roi_stats = {
+                "roi_short": roi_key,
+                "roi_full": model_dict["roi_dict"][roi_key],
+                "mean_truth": roi_truth.mean(),
+                "std_truth": roi_truth.std(),
+                "mean_prediction": roi_prediction.mean(),
+                "std_prediction": roi_prediction.std(),
+                "me_difference": roi_difference.mean(),
+                "mae_difference": np.abs(roi_difference).mean(),
+                "rmse_difference": np.sqrt(np.mean(roi_difference ** 2)),
+            }
+            roi_list.append(roi_stats)
+        
+        pd.DataFrame(roi_list).to_csv(op.join(outdir, "roi_stats.csv"), index=False)
+        logging.info(f"ROI statistics saved to {op.join(outdir, 'roi_stats.csv')}")
+
+    logging.info("ROI statistics done")
